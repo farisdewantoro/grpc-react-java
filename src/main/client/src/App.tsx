@@ -4,7 +4,7 @@ import './App.css';
 import {HelloRequest, HelloResponse} from './protoGen/HelloService_pb';
 import {HelloServiceClient} from './protoGen/HelloService_grpc_web_pb';
 import {FileUploadChunkRequest, FileUploadChunkResponse} from './protoGen/FileUploadService_pb';
-import {FileUploadServiceClient} from './protoGen/FileUploadService_grpc_web_pb';
+import {FileUploadServiceClient,FileUploadServicePromiseClient} from './protoGen/FileUploadService_grpc_web_pb';
 import {v4 as uuidv4} from 'uuid';
 type FileDataChunk = {
   // storing the waiting time after all chunk uploads done
@@ -27,13 +27,15 @@ type FileDataChunk = {
 interface FileUploadOptions{
   binary:boolean,
   chunkSize:number,
-  chunkReadCallback:Function, 
+  chunkReadCallback:ChunkReadCallback, 
   chunkErrorCallback:Function, 
   successCallback:Function
 }
-
+interface ChunkReadCallback {
+  (chunk:ArrayBuffer, os:number, ctn:number): Promise<Boolean>;
+}
 var client = new HelloServiceClient('http://localhost:8000');
-var grpcFileUploadClient = new FileUploadServiceClient('http://localhost:8000');
+var grpcFileUploadClient = new FileUploadServicePromiseClient('http://localhost:8000');
 function App() {
   const [firstName,setFirstName] = useState("FirstName");
   const [lastName,setLastName] = useState("LastName");
@@ -97,53 +99,7 @@ function App() {
       readFileInChunks(fileDataChunk.file,chunkFile,options);
       
   }
-  const upload =(start:number,file:File,uuid:string)=>{
 
-
-    if(!fileDataChunkRef.current) return;
-    var next_slice = Math.min(start + fileDataChunkRef.current?.chunkSize,file.size);
-    var blob = file.slice( start, next_slice );
-      var chunkFile = new FileUploadChunkRequest();
-      chunkFile.setUuid(uuid);
-      chunkFile.setName(file.name);
-      chunkFile.setSize(file.size);
-    var reader = new FileReader();
-    reader.onloadend = function(event){
-
-       chunkFile.setOffset(start);
-      if(event.target?.readyState !== FileReader.DONE || event.target.result == null){
-        chunkFile.setFinished(true);
-        console.log(event.target?.readyState,"end");
-        grpcFileUploadClient.uploadFileChunk(chunkFile,(err,res)=>{
-          console.log(err);
-          console.log(res);
-        });
-        return;
-      }
-      chunkFile.setFinished(false);
-      chunkFile.setChunk(new Uint8Array(event.target.result as ArrayBuffer));
-
- 
-      grpcFileUploadClient.uploadFileChunk(chunkFile,(err,res)=>{
-          console.log(res?.getInfo());
-      });
-      console.log("size :",chunkFile.getUuid(),start,file.size);
-      if(start < file.size){
-        upload(next_slice,file,uuid);
-      }else{
-        chunkFile.setFinished(true);
-        console.log("end",next_slice);
-        grpcFileUploadClient.uploadFileChunk(chunkFile,(err,res)=>{
-          console.log(err);
-         console.log(res?.getInfo());
-        });
-      }
-    
-    }
-    reader.readAsArrayBuffer( blob );
-
-
-  }
 
   const fileUploadOptions = (amountChunks:number,chunkFile:FileUploadChunkRequest)=>{
     // wait after file reader is finished: amountChunks * 100ms, depends abit on the upload speed
@@ -162,7 +118,7 @@ function App() {
         chunkErrorCallback: () => {
           fileUploadFailed("file reader error")
         },
-        chunkReadCallback:async (chunk:ArrayBuffer, os:number, ctn:number) => {
+        chunkReadCallback:async (chunk:ArrayBuffer, os:number, ctn:number):Promise<Boolean>=> {
             // once a chunk is read
             if (typeof chunk === "string") {
               chunkFile.setChunk(btoa(chunk))
@@ -172,22 +128,12 @@ function App() {
             chunkFile.setOffset(os);
             chunkFile.setChunknumber(ctn);
             console.log("CHUNK FILE;",chunkFile.getOffset(),chunkFile.getChunknumber());
-
-            grpcFileUploadClient.uploadFileChunk(chunkFile,(err,res)=>{
-              if(err){
-                setFileUploadData(prev=>({
-                  ...prev,
-                  chunkUploadError:true
-                }));
-                console.log(err.message, "chunk :",chunkFile.getOffset(),chunkFile.getChunknumber());
-
-                return;
-              }
-
+            try {
+              await grpcFileUploadClient.uploadFileChunk(chunkFile);
               setFileUploadData(prev=>({
                 ...prev,
                 currentUploads:prev.currentUploads.map((x,j)=>{
-
+  
                   if(j == ctn){
                     x = false;
                   }
@@ -195,8 +141,18 @@ function App() {
                 })
               }));
               calculateUploadStatus();
-            });
-
+              return Promise.resolve(true);
+            } catch (error) {
+              setFileUploadData(prev=>({
+                ...prev,
+                chunkUploadError:true
+              }));
+              console.log(error.message, "chunk :",chunkFile.getOffset(),chunkFile.getChunknumber());
+              return Promise.resolve(false);
+            }
+      
+        
+       
         },
         successCallback: (c:any) => {
             // success callback doesnt mean that all files already uploaded, just read by filereader
@@ -205,15 +161,16 @@ function App() {
             console.log("SUCCESS",chunkFile.getSize(),chunkFile.getOffset());
        
             // but first wait for all upload chunks callbacks
-            waitFor(() => allUploadsDone(), () => {
-              grpcFileUploadClient.uploadFileChunk(chunkFile,(err,res:FileUploadChunkResponse|null)=>{
-                 if(err){
-                    fileUploadFailed("error final upload piece" + err);
-                    return;
-                 }
-                 let url = res?.getInfo()?.toObject().url;
-                 console.log(url)
-              });
+            waitFor(() => allUploadsDone(),async () => {
+              try {
+                const result = await grpcFileUploadClient.uploadFileChunk(chunkFile);
+                let url = result?.getInfo()?.toObject().url;
+                console.log(url)
+              } catch (error) {
+                fileUploadFailed("error final upload piece" + error);
+                return;
+              }
+         
             });
         }
     };
@@ -277,7 +234,6 @@ function App() {
       };
 
       options = {
-          ...defaults,
           ...options
       };
 
@@ -285,13 +241,23 @@ function App() {
       const fileSize = file.size;
       let offset = 0;
 
-      const onLoadHandler = (evt:any) => {
+      const onLoadHandler = async (evt:any) => {
           if (evt?.target?.error == null) {
             console.log(evt.target.result.byteLength, evt.target.result.length,evt.target.result);
               offset += binary ? evt.target?.result?.byteLength : evt.target.result.length;
        
-              chunkReadCallback(evt.target.result, offset, counter);
-              counter++
+              let result = await chunkReadCallback(evt.target.result, offset, counter);
+              if(!result){
+                  let maxRetry = 5;
+                  while(!result || maxRetry == 0){
+                    result = await chunkReadCallback(evt.target.result,offset,counter);
+                    maxRetry--;
+                    console.log("RETRY: ",maxRetry);
+                  }
+              }else{
+                counter++
+              }
+              
           } else {
               return chunkErrorCallback(evt.target.error);
           }
@@ -344,12 +310,12 @@ function App() {
     helloRequest.setFirstname(firstName);
     helloRequest.setLastname(lastName);
 
-    client.hello(helloRequest,function(err:ServiceError|null,res:HelloResponse|null){
+    // client.hello(helloRequest,function(err:ServiceError|null,res:HelloResponse|null){
 
-        if(res != null){
-          console.log(res.toObject());
-        }
-    });
+    //     if(res != null){
+    //       console.log(res.toObject());
+    //     }
+    // });
     // client.hello(helloRequest,{headersMap},function(err,res){
     //     console.log(res);
     //     if(res != null){
