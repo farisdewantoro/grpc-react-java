@@ -1,0 +1,51 @@
+syntax = "proto3";
+option java_package = "org.example.grpc";
+option java_multiple_files = true;
+
+service FileUploadService{
+  rpc UploadFileChunk(FileUploadChunkRequest) returns (FileUploadChunkResponse);
+  rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
+}
+
+// used for plain grpcs service to grpc service
+message UploadFileRequest{
+  oneof data {
+    FileInfo info = 1;
+    bytes chunk_data = 2;
+  };
+}
+
+message Empty {
+
+}
+// used for plain grpcs service to grpc service
+message FileInfo{
+  string name = 1;
+  int64 size = 2;
+  string type = 3;
+
+}
+// used for plain grpcs service to grpc service and web grpcs
+message UploadFileResponse {
+  string url = 1;
+  string id = 2;
+  uint64 size = 3;
+}
+// used for web grpcs, can not use one of caused by async communication
+message FileUploadChunkRequest{
+  string uuid = 1;
+  bytes chunk = 2;
+  uint64 offset = 3;
+  uint64 size = 4;
+  string name = 5;
+  string type = 6;
+  bool finished = 7;
+  uint64 chunkNumber = 8;
+}
+// used for web grpcs
+message FileUploadChunkResponse{
+  oneof data {
+    UploadFileResponse info = 1;
+    Empty empty = 2;
+  };
+}
